@@ -60,8 +60,22 @@ function dateKey(timestamp) {
 
 function emptyUsage() { return { total: 0, input: 0, output: 0, cached: 0 }; }
 
+function nativeTokens(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const fields = ['input_tokens', 'output_tokens', 'cached_input_tokens', 'total_tokens'];
+  if (!fields.some(field => Object.hasOwn(raw, field))) return null;
+  const nums = fields.map(field => raw[field] === undefined ? 0 : raw[field]);
+  if (nums.some(v => typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0)) return null;
+  const [input, output, cached, reportedTotal] = nums;
+  if (cached > input || (reportedTotal && reportedTotal < input + output)) return null;
+  return { input, output, cached, total: reportedTotal || input + output };
+}
+
 async function scanFile(file, codexDir, seenResponseIds, warnings) {
   const session = { usage: emptyUsage(), daily: new Map(), responseCount: 0, id: null, cwd: null, model: 'Unknown', lastTimestamp: null };
+  const cumulative = { usage: emptyUsage(), daily: new Map(), responseCount: 0, lastTimestamp: null };
+  let prior = emptyUsage();
+  let hasNative = false;
   const stream = fs.createReadStream(file, { encoding: 'utf8' });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
   try {
@@ -75,6 +89,28 @@ async function scanFile(file, codexDir, seenResponseIds, warnings) {
         session.cwd = payload.cwd || session.cwd;
       }
       if (record.type === 'turn_context' && payload.model) session.model = String(payload.model);
+      if (record.type === 'event_msg' && payload.type === 'token_count') {
+        const current = nativeTokens(payload.info?.total_token_usage);
+        if (!current) continue;
+        hasNative = true;
+        const delta = {
+          input: Math.max(0, current.input - prior.input),
+          output: Math.max(0, current.output - prior.output),
+          cached: Math.max(0, current.cached - prior.cached),
+          total: Math.max(0, current.total - prior.total)
+        };
+        prior = Object.fromEntries(Object.keys(delta).map(key => [key, Math.max(prior[key], current[key])]));
+        if (!delta.total && !delta.input && !delta.output) continue;
+        addUsage(cumulative.usage, delta);
+        const day = dateKey(record.timestamp || payload.timestamp);
+        if (day) {
+          if (!cumulative.daily.has(day)) cumulative.daily.set(day, emptyUsage());
+          addUsage(cumulative.daily.get(day), delta);
+        }
+        cumulative.responseCount += 1;
+        cumulative.lastTimestamp = record.timestamp || cumulative.lastTimestamp;
+        continue;
+      }
       if (record.type !== 'token_usage_record') continue;
       const responseId = payload.response_id || `${payload.session_id || session.id || file}:${payload.turn_id || record.ordinal}`;
       if (seenResponseIds.has(responseId)) continue;
@@ -97,6 +133,12 @@ async function scanFile(file, codexDir, seenResponseIds, warnings) {
     warnings.unreadableFiles += 1;
     console.warn(`Warning: skipped unreadable history file (${path.basename(file)}): ${error.code || error.message}`);
     return null;
+  }
+  if (hasNative) {
+    session.usage = cumulative.usage;
+    session.daily = cumulative.daily;
+    session.responseCount = cumulative.responseCount;
+    session.lastTimestamp = cumulative.lastTimestamp;
   }
   if (!session.id) session.id = path.basename(file);
   session.project = projectName(session.cwd, codexDir);
