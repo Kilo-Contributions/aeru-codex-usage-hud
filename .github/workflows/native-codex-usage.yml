@@ -1,0 +1,43 @@
+name: Native Codex usage reality tests
+
+on:
+  pull_request:
+    paths:
+      - 'usage.js'
+      - 'server.js'
+      - 'public/index.html'
+      - 'test/**'
+      - '.github/workflows/native-codex-usage.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'usage.js'
+      - 'server.js'
+      - 'public/index.html'
+      - 'test/**'
+      - '.github/workflows/native-codex-usage.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  local-real-http:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Syntax and real filesystem / loopback HTTP canaries
+        run: npm run check
+      - name: Scope receipt
+        run: |
+          echo "LOCAL_SOURCE_AND_LOOPBACK_HTTP_ONLY"
+          echo "No billing-provider verification, no private session history, no fleet runtime deployment."

@@ -78,3 +78,27 @@ This repository deliberately ignores Codex session data, JSONL files, databases,
 ## License
 
 [MIT](LICENSE)
+
+## Codex native event accounting (2026-10-16)
+
+The dashboard reads local Codex `event_msg` / `token_count` rows from
+`payload.info.last_token_usage` in addition to legacy `token_usage_record` logs.
+It does not add cumulative `total_token_usage` snapshots on every event.
+Duplicated native snapshots with identical cumulative evidence are suppressed;
+when both native and legacy records appear in one file, the native projection
+wins and coverage is marked `partial_mixed` rather than double-charging.
+
+`source.usageCoverage` is `observed`, `partial_mixed`, or `unavailable`.
+No admissible records means **unknown** consumption, not proof of zero usage.
+The displayed cost is an API-rate estimate, not an invoice or subscription spend.
+
+The `test/native-codex-e2e.test.js` suite exercises temporary on-disk
+Codex-shaped JSONL through both the parser and a real loopback HTTP server.
+It checks the 180-token native case, legacy response-id and missing-ID
+deduplication, mixed representation, missing evidence and negative controls.
+Public CI runs on both Windows and Linux, but cannot prove correctness
+against all installed Codex versions or subagent-lineage copies.
+
+Design references: [Token Meter](https://github.com/splunk/token-meter)
+and [Vibehours](https://github.com/Jacklord1/vibehours).
+No transcripts, credentials or local source paths are sent over the network.
