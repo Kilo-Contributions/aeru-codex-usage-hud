@@ -61,11 +61,16 @@ function dateKey(timestamp) {
 function emptyUsage() { return { total: 0, input: 0, output: 0, cached: 0 }; }
 
 async function scanFile(file, codexDir, seenResponseIds, warnings) {
-  const session = { usage: emptyUsage(), daily: new Map(), responseCount: 0, id: null, cwd: null, model: 'Unknown', lastTimestamp: null };
+  const session = { usage: emptyUsage(), daily: new Map(), responseCount: 0, id: null, cwd: null, model: 'Unknown', lastTimestamp: null, nativeUsageEvents: 0, legacyUsageRecords: 0 };
+  const bucket = () => ({ usage: emptyUsage(), daily: new Map(), responseCount: 0, lastTimestamp: null, ids: new Set() });
+  const bins = { native: bucket(), legacy: bucket() };
   const stream = fs.createReadStream(file, { encoding: 'utf8' });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let lineNumber = 0;
+  let previousNativeCumulative = null;
   try {
     for await (const line of lines) {
+      lineNumber += 1;
       if (!line.trim()) continue;
       let record;
       try { record = JSON.parse(line); } catch { warnings.malformedLines += 1; continue; }
@@ -75,23 +80,43 @@ async function scanFile(file, codexDir, seenResponseIds, warnings) {
         session.cwd = payload.cwd || session.cwd;
       }
       if (record.type === 'turn_context' && payload.model) session.model = String(payload.model);
-      if (record.type !== 'token_usage_record') continue;
-      const responseId = payload.response_id || `${payload.session_id || session.id || file}:${payload.turn_id || record.ordinal}`;
-      if (seenResponseIds.has(responseId)) continue;
-      seenResponseIds.add(responseId);
-      const usage = payload.usage || payload.turn_token_usage;
-      if (!usage) continue;
+      // Current Codex stores incremental usage in event_msg/token_count.info.last_token_usage.
+      // Never add the cumulative total_token_usage on every event.
+      const native = record.type === 'event_msg' && payload.type === 'token_count';
+      const legacy = record.type === 'token_usage_record';
+      if (!native && !legacy) continue;
+      const info = payload.info && typeof payload.info === 'object' ? payload.info : {};
+      const usage = native ? info.last_token_usage : (payload.usage || payload.turn_token_usage);
+      if (!usage || typeof usage !== 'object' || Array.isArray(usage)) continue;
       const parsed = emptyUsage();
       addUsage(parsed, usage);
       if (!parsed.total && !parsed.input && !parsed.output) continue;
-      addUsage(session.usage, usage);
+      // Native Codex may repeat a completed token snapshot with the exact same
+      // cumulative counts. Only suppress such duplicates when BOTH normalized
+      // incremental and cumulative fields agree, never merely same token size.
+      const cumulative = native && info.total_token_usage && typeof info.total_token_usage === 'object'
+        ? info.total_token_usage : null;
+      const signature = cumulative ? JSON.stringify([
+        parsed.input, parsed.output, parsed.cached, parsed.total,
+        number(cumulative.input_tokens), number(cumulative.output_tokens),
+        number(cumulative.cached_input_tokens), number(cumulative.total_tokens)
+      ]) : null;
+      if (signature && signature === previousNativeCumulative) continue;
+      const responseId = payload.response_id || (native
+        ? `${file}:${lineNumber}`
+        : `${payload.session_id || session.id || file}:${payload.turn_id || record.ordinal}`);
+      const bin = native ? bins.native : bins.legacy;
+      if (seenResponseIds.has(responseId) || bin.ids.has(responseId)) continue;
+      bin.ids.add(responseId);
+      if (native) previousNativeCumulative = signature;
+      addUsage(bin.usage, usage);
       const day = dateKey(record.timestamp || payload.timestamp);
       if (day) {
-        if (!session.daily.has(day)) session.daily.set(day, emptyUsage());
-        addUsage(session.daily.get(day), usage);
+        if (!bin.daily.has(day)) bin.daily.set(day, emptyUsage());
+        addUsage(bin.daily.get(day), usage);
       }
-      session.responseCount += 1;
-      session.lastTimestamp = record.timestamp || session.lastTimestamp;
+      bin.responseCount += 1;
+      bin.lastTimestamp = record.timestamp || bin.lastTimestamp;
     }
   } catch (error) {
     warnings.unreadableFiles += 1;
@@ -100,6 +125,17 @@ async function scanFile(file, codexDir, seenResponseIds, warnings) {
   }
   if (!session.id) session.id = path.basename(file);
   session.project = projectName(session.cwd, codexDir);
+  // Both record formats may describe one response: choose one per file.
+  // This favors undercounting uncertain mixed-only records over double billing.
+  const picked = bins.native.responseCount ? bins.native : bins.legacy;
+  session.mixedUsageRepresentations = !!(bins.native.responseCount && bins.legacy.responseCount);
+  session.nativeUsageEvents = bins.native.responseCount;
+  session.legacyUsageRecords = bins.native.responseCount ? 0 : bins.legacy.responseCount;
+  session.usage = picked.usage;
+  session.daily = picked.daily;
+  session.responseCount = picked.responseCount;
+  session.lastTimestamp = picked.lastTimestamp;
+  for (const id of picked.ids) seenResponseIds.add(id);
   return session;
 }
 
@@ -154,12 +190,16 @@ async function scanCodexUsage({ codexDir = path.join(process.env.USERPROFILE || 
   const projects = new Map();
   const models = new Map();
   const sessions = [];
+  const usageEvidence = { nativeEvents: 0, legacyRecords: 0, mixedFiles: 0 };
 
   for (const file of files) {
     const session = await scanFile(file, codexDir, seenResponseIds, warnings);
     if (!session || seenSessionIds.has(session.id)) continue;
     seenSessionIds.add(session.id);
     sessions.push(session);
+    usageEvidence.nativeEvents += session.nativeUsageEvents;
+    usageEvidence.legacyRecords += session.legacyUsageRecords;
+    if (session.mixedUsageRepresentations) usageEvidence.mixedFiles += 1;
     addUsage(totals, session.usage);
     for (const [day, value] of session.daily) {
       if (!daily.has(day)) daily.set(day, emptyUsage());
@@ -185,7 +225,8 @@ async function scanCodexUsage({ codexDir = path.join(process.env.USERPROFILE || 
 
   return {
     generatedAt: new Date().toISOString(),
-    source: { filesScanned: files.length, sessionsFound: sessions.length, archivedIncluded: archivedFiles.length > 0, scanDurationMs: Date.now() - started },
+    source: { filesScanned: files.length, sessionsFound: sessions.length, archivedIncluded: archivedFiles.length > 0, scanDurationMs: Date.now() - started,
+      usageEvidence, usageCoverage: usageEvidence.nativeEvents + usageEvidence.legacyRecords ? (usageEvidence.mixedFiles ? 'partial_mixed' : 'observed') : 'unavailable' },
     lifetime: {
       totalTokens: totals.total,
       inputTokens: totals.input,
