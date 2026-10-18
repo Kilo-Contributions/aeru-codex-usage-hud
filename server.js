@@ -29,8 +29,26 @@ function openBrowser(url) {
   else execFile('xdg-open', [url]);
 }
 
+function isTrustedLocalRequest(request, address) {
+  // Loopback binding alone does not reject a DNS-rebound browser origin.
+  if (!address || typeof address === 'string') return false;
+  const host = request.headers.host;
+  if (typeof host !== 'string') return false;
+  const expected = ['127.0.0.1:' + address.port, 'localhost:' + address.port];
+  if (!expected.includes(host.toLowerCase())) return false;
+  const origin = request.headers.origin;
+  return origin === undefined ||
+    (typeof origin === 'string' && origin.toLowerCase() === 'http://' + host.toLowerCase());
+}
+
 function createServer({ codexDir = CODEX_DIR } = {}) {
   return http.createServer(async (request, response) => {
+    if (!isTrustedLocalRequest(request, response.socket.server.address())) {
+      response.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store' });
+      response.end('Forbidden');
+      return;
+    }
     const pathname = new URL(request.url, `http://${HOST}`).pathname;
     if (pathname === '/api/usage') {
       const weekOffset = Number(new URL(request.url, `http://${HOST}`).searchParams.get('weekOffset')) || 0;
